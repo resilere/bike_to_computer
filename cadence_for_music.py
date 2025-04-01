@@ -35,12 +35,18 @@ def decode_csc_data(data, previous_revolutions=None, previous_time=None):
 
 # Real-time cadence handler
 class CadenceHandler:
-    def __init__(self):
+    def __init__(self, wheel_circumference=2.1,cadence_timeout=3):
         self.previous_revolutions = None
         self.previous_time = None
         self.last_cadence = None  # Store last cadence value to track changes
-        self.last_keypress_time = time.time()  # Track the time of the last keypress
+        self.last_valid_cadence = 0  # Store last non-None cadence
+        self.last_cadence_time = None  # Last time we received a valid cadence
         self.is_music_playing = False  # Track music state
+        self.total_revolutions = 0
+        self.start_time = None  # Track session start time
+        self.total_time = 0  # Track time spent pedaling
+        self.wheel_circumference = wheel_circumference  # in meters
+        self.cadence_timeout = cadence_timeout  # Allow signal drops for this many seconds
     def handle_data(self, sender, data):
         # Decode and calculate cadence
         print(f"Data from {sender}: {data}")
@@ -49,19 +55,41 @@ class CadenceHandler:
             self.previous_revolutions,
             self.previous_time,
         )
-        if cadence is None or cadence <= 50:
-            if self.is_music_playing:
-                keyboard.send("play/pause media")  # Pause music
-                self.is_music_playing = False
-                print("Music Paused ⏸")
-
+        current_time = time.time()
+        
+        # Use the last valid cadence if current one is None
+        if cadence is not None:
+            self.last_valid_cadence = cadence
+            self.last_cadence_time = current_time  # Update last valid signal time
+        elif self.last_cadence_time and (current_time - self.last_cadence_time) < self.cadence_timeout:
+            cadence = self.last_valid_cadence  # Use the last valid cadence
         else:
+            cadence = 0  # If timeout passed, assume stopped
+
+        # Start tracking time when first cadence appears
+        if self.start_time is None and cadence is not None and cadence > 0:
+            self.start_time = current_time
+        
+        if cadence > 50:
             if not self.is_music_playing:
                 keyboard.send("play/pause media")  # Play music
                 self.is_music_playing = True
                 print("Music Started 🎵")
-        
 
+        else:  # Stop after timeout
+            if self.is_music_playing:
+                keyboard.send("play/pause media")  # Pause music
+                self.is_music_playing = False
+                print("Music Paused ⏸")
+        # Update total revolutions if cadence is valid
+        if cadence > 0:
+            self.total_revolutions += cadence / 60  # Convert RPM to revolutions per second
+            self.total_time = current_time - self.start_time  # Update ride time
+        # Calculate total distance
+        total_distance = (self.total_revolutions * self.wheel_circumference) / 1000  # in km
+         # Display stats
+        print(f"Total Ride Time: {self.total_time:.2f} seconds")
+        print(f"Estimated Distance: {total_distance:.2f} km")
 # Main subscription function
 async def subscribe_to_cadence(address, char_uuid):
     cadence_handler = CadenceHandler()
