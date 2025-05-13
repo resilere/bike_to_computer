@@ -10,8 +10,10 @@ from bleak import BleakClient
 from collections import deque
 import threading
 from datetime import datetime
-import xml.etree.ElementTree as ET
+
+from xml.etree.ElementTree import Element, SubElement, ElementTree
 import os
+import xml.dom.minidom
 
 CADENCE_CHARACTERISTIC_UUID = "00002a5b-0000-1000-8000-00805f9b34fb"  # Replace if needed
 DEVICE_ADDRESS = "E5:80:49:E3:FC:92"  # Replace with your sensor's address
@@ -48,7 +50,8 @@ class CadenceHandler:
         self.cadence_timeout = cadence_timeout
         self.timestamps = deque(maxlen=300)
         self.cadences = deque(maxlen=300)
-        
+        self.trackpoints = []  # List to store (timestamp, cadence, distance)
+    
     def handle_data(self, sender, data):
         self.previous_revolutions, self.previous_time, cadence = decode_csc_data(
             data, self.previous_revolutions, self.previous_time)
@@ -79,7 +82,9 @@ class CadenceHandler:
         if cadence > 0:
             self.total_revolutions += cadence / 60
             self.total_time = current_time - self.start_time
-
+            distance_km = (self.total_revolutions * self.wheel_circumference) / 1000
+            self.trackpoints.append((time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(current_time)), cadence, distance_km))
+        
         total_distance = (self.total_revolutions * self.wheel_circumference) / 1000
         print(f"Cadence: {cadence:.2f} RPM")
         print(f"Total Ride Time: {self.total_time:.2f} seconds")
@@ -88,36 +93,41 @@ class CadenceHandler:
         self.timestamps.append(current_time)
         self.cadences.append(cadence)
 
-def generate_tcx(filename, start_time, duration_sec, distance_km):
-    tcx_ns = "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"
-    ET.register_namespace('', tcx_ns)
+def save_tcx(trackpoints):
+    
+    tcx = Element("TrainingCenterDatabase", {
+        "xmlns": "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2",
+        "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+        "xsi:schemaLocation": "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2 http://www.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd"
+    })
 
-    root = ET.Element(f"{{{tcx_ns}}}TrainingCenterDatabase")
-    activities = ET.SubElement(root, f"{{{tcx_ns}}}Activities")
-    activity = ET.SubElement(activities, f"{{{tcx_ns}}}Activity", Sport="Biking")
-    ET.SubElement(activity, f"{{{tcx_ns}}}Id").text = start_time.isoformat()
+    activities = SubElement(tcx, "Activities")
+    activity = SubElement(activities, "Activity", Sport="Biking")
+    SubElement(activity, "Id").text = trackpoints[0][0] if trackpoints else datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    lap = ET.SubElement(activity, f"{{{tcx_ns}}}Lap", StartTime=start_time.isoformat())
-    ET.SubElement(lap, f"{{{tcx_ns}}}TotalTimeSeconds").text = f"{duration_sec:.1f}"
-    ET.SubElement(lap, f"{{{tcx_ns}}}DistanceMeters").text = f"{distance_km * 1000:.1f}"
-    ET.SubElement(lap, f"{{{tcx_ns}}}Intensity").text = "Active"
-    ET.SubElement(lap, f"{{{tcx_ns}}}TriggerMethod").text = "Manual"
+    lap = SubElement(activity, "Lap", StartTime=trackpoints[0][0])
+    SubElement(lap, "TotalTimeSeconds").text = str(
+        (datetime.strptime(trackpoints[-1][0], "%Y-%m-%dT%H:%M:%SZ") -
+         datetime.strptime(trackpoints[0][0], "%Y-%m-%dT%H:%M:%SZ")).total_seconds())
+    SubElement(lap, "DistanceMeters").text = str(trackpoints[-1][2] * 1000)
 
-    tree = ET.ElementTree(root)
-    tree.write(filename, encoding="utf-8", xml_declaration=True)
-    print(f"Workout saved to {os.path.abspath(filename)}")
+    track = SubElement(lap, "Track")
+    for timestamp, cadence, distance_km in trackpoints:
+        tp = SubElement(track, "Trackpoint")
+        SubElement(tp, "Time").text = timestamp
+        SubElement(tp, "DistanceMeters").text = str(distance_km * 1000)
+        SubElement(tp, "Cadence").text = str(int(cadence))
+
+    filename = f"workout_{datetime.now().strftime('%Y%m%d_%H%M')}.tcx"
+    ElementTree(tcx).write(filename, encoding="utf-8", xml_declaration=True)
+    print(f"Workout saved to {filename}")
 
 def stop_button_callback(event):
     global is_running
     is_running = False
     if cadence_handler.start_time:
-        end_time = time.time()
-        duration = cadence_handler.total_time
-        distance = (cadence_handler.total_revolutions * cadence_handler.wheel_circumference) / 1000
-        start_time_dt = datetime.fromtimestamp(cadence_handler.start_time)
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"workout_{timestamp}.tcx"
-        generate_tcx(filename, start_time_dt, duration, distance)
+        
+        save_tcx(cadence_handler.trackpoints)
     plt.close()
 
 # Plotting function
@@ -153,14 +163,7 @@ async def subscribe_to_cadence(address, char_uuid):
             print("Stopping notification...")
         finally:
             await client.stop_notify(char_uuid)
-            if cadence_handler.start_time:
-                end_time = time.time()
-                duration = cadence_handler.total_time
-                distance = (cadence_handler.total_revolutions * cadence_handler.wheel_circumference) / 1000
-                start_time_dt = datetime.fromtimestamp(cadence_handler.start_time)
-                generate_tcx("workout.tcx", start_time_dt, duration, distance)
-
-                print("Disconnected from device")
+            print("Disconnected from device")
 
 # Setup
 cadence_handler = CadenceHandler()
